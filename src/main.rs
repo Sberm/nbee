@@ -13,13 +13,31 @@
 //       --------------
 
 use std::net::{TcpListener, TcpStream};
-use std::io::{Write, Read};
+use std::io::{Write, Read, SeekFrom, Seek};
+use std::mem::{size_of, transmute};
+use std::fs::{File, exists, OpenOptions};
 
 const NBDMAGIC: u64 = 0x4e42444d41474943;
 const IHAVEOPT: u64 = 0x49484156454F5054;
 const NBD_FLAG_FIXED_NEWSTYLE: u16 = 1 << 0;
 const NBD_REPLY_MAGIC: u64 = 0x3e889045565a9;
-const NBD_REP_ACK: u32 = 0;
+const NBD_REP_ACK: u32 = 1;
+const NBD_REP_INFO: u32 = 3;
+const BLOCK_SIZE: u64 = 50 * 1024 * 1024; // 20MB
+const NBD_OPT_GO: u32 = 7;
+const NBD_INFO_EXPORT: u16 = 0;
+const NBD_OPT_EXPORT_NAME: u32 = 0;
+const NBD_SIMPLE_REPLY_MAGIC: u32 = 0x67446698;
+
+// --- transmission flags
+const NBD_FLAG_SEND_FLUSH: u16 = 1 << 2;
+
+// --- request types
+const NBD_CMD_READ: u16 = 0;
+const NBD_CMD_WRITE: u16 = 1;
+const NBD_CMD_FLUSH: u16 = 3;
+
+const FILE: &str = "disk.img";
 
 fn write_u16<W: Write>(writer: &mut W, data: u16) {
     writer.write_all(&data.to_be_bytes()).expect("failed to write u16");
@@ -45,69 +63,207 @@ fn read_u64<R: Read>(reader: &mut R) -> u64 {
     u64::from_be_bytes(buf)
 }
 
-fn print_client_input(stream: &mut TcpStream) {
-    // debug
-    let mut debug_buf: [u8; 1024] = [0; 1024];
-    let _ = stream.read_exact(&mut debug_buf);
-    for i in 0..1024/64 {
-        for j in 0..64 {
-            print!("{}", debug_buf[i * 64 + j]);
+#[allow(unused)]
+fn clear_file(file: &mut File) {
+    let buf = [0u8; 8192];
+    let mut size: i64 = file.metadata().expect("fail to get metadata").len() as i64;
+    println!("clearing file of size {}", size);
+    while size > 0 {
+        size -= file.write(&buf).expect("failed to write") as i64;
+    }
+    file.flush().expect("fail to flush");
+}
+
+// problem: it's not compact
+#[derive(Default, Debug)]
+struct ReqHeader {
+    magic: u32,
+    comm_flags: u16,
+    type_: u16,
+    cookie: u64,
+    offset: u64,
+    length: u32
+}
+
+enum STATE {
+    HANDSHAKE,
+    TRANSMISSION
+}
+
+struct StateMachine {
+    state: STATE
+}
+
+fn read_header(stream: &mut TcpStream, req_header: &mut ReqHeader) {
+    let mut buf = [0u8; 28];
+    let _ = stream.read_exact(&mut buf).expect("failed to read request header");
+    req_header.magic = u32::from_be_bytes(buf[0..4].try_into().expect("failed to turn slice to [u8; 4]"));
+    req_header.comm_flags = u16::from_be_bytes(buf[4..6].try_into().expect("failed to turn slice to [u8; 2]"));
+    req_header.type_ = u16::from_be_bytes(buf[6..8].try_into().expect("failed to turn slice to [u8; 2]"));
+    req_header.cookie = u64::from_be_bytes(buf[8..16].try_into().expect("failed to turn slice to [u8; 8]"));
+    req_header.offset = u64::from_be_bytes(buf[16..24].try_into().expect("failed to turn slice to [u8; 8]"));
+    req_header.length = u32::from_be_bytes(buf[24..28].try_into().expect("failed to turn slice to [u8; 4]"));
+}
+
+fn reply(stream: &mut TcpStream, cookie: u64, buf: Option<&mut [u8]>) {
+    write_u32(stream, NBD_SIMPLE_REPLY_MAGIC);
+    write_u32(stream, 0); // error code
+    write_u64(stream, cookie);
+    if buf.is_some() {
+        stream.write_all(buf.expect("I thought it was some")).expect("failed to write all");
+    }
+}
+
+// =========================== handshake ===========================
+fn handshake(mut stream: TcpStream) {
+    write_u64(&mut stream, NBDMAGIC);
+    write_u64(&mut stream, IHAVEOPT);
+    let handshake_flags: u16 = NBD_FLAG_FIXED_NEWSTYLE;
+    write_u16(&mut stream, handshake_flags);
+
+    // client u32 flags
+    let client_flags = read_u32(&mut stream);
+    println!("client flags: {}", client_flags);
+    if client_flags != NBD_FLAG_FIXED_NEWSTYLE as u32 {
+        // SHOULD
+        println!("client didn't set NBD_FLAG_FIXED_NEWSTYLE");
+    }
+    // client opts
+    let client_i_have_opts = read_u64(&mut stream);
+    println!("client_i_have_opts {}", client_i_have_opts);
+    if client_i_have_opts != IHAVEOPT {
+        // TODO: tell client it's unwelcome
+        panic!("client didn't send IHAVEOPT");
+    }
+    let client_opts = read_u32(&mut stream);
+    println!("client_opts {}", client_opts);
+    let client_opts_len = read_u32(&mut stream);
+    println!("client_opts_len {}", client_opts_len);
+    let mut opts_buf: [u8; 2048] = [0; 2048];
+    let _ = stream.read_exact(&mut opts_buf[..(client_opts_len as usize)]);
+    println!("client opts buf:");
+    for i in 0..(client_opts_len as usize) {
+        if opts_buf[i] <= 32 {
+            println!("{}", opts_buf[i]);
+        } else {
+            print!("{}", opts_buf[i] as char)
         }
-        println!();
+    }
+    println!();
+
+    write_u64(&mut stream, NBD_REPLY_MAGIC);
+    write_u32(&mut stream, NBD_OPT_EXPORT_NAME);
+    write_u32(&mut stream, NBD_REP_INFO);
+    write_u16(&mut stream, NBD_INFO_EXPORT);
+    write_u16(&mut stream, 12);
+    write_u16(&mut stream, NBD_INFO_EXPORT);
+    write_u64(&mut stream, BLOCK_SIZE);
+    write_u16(&mut stream, NBD_FLAG_SEND_FLUSH);// transmission flags
+    println!("wrote size");
+
+    write_u64(&mut stream, NBD_REPLY_MAGIC);
+    write_u32(&mut stream, NBD_OPT_GO);
+    write_u32(&mut stream, NBD_REP_ACK);
+    write_u32(&mut stream, 0); // make it easy, set to 0
+    println!("handshake completed");
+
+    // =========================== transmission ===========================
+    if !exists(FILE).expect("failed to check if exists") {
+        File::create(FILE).expect("failed to create file");
+    }
+    let mut file = OpenOptions::new().read(true).write(true).open(FILE).expect("failed to open file");
+    file.set_len(BLOCK_SIZE).expect("failed to set length");
+
+    // only clear the file first time
+    // clear_file(&mut file);
+
+    loop {
+        file.rewind().expect("file failed to rewind");
+        // read header
+        let mut header = ReqHeader {..Default::default()};
+        read_header(&mut stream, &mut header);
+        println!("got request");
+        println!("header {:?}", header);
+
+        // TODO: implement read
+        match header.type_ {
+            NBD_CMD_READ => {
+                file.seek(SeekFrom::Start(header.offset)).expect("failed to seek");
+                let mut buf = vec![0u8; header.length as usize];
+                let bytes = file.read(&mut buf[..]).expect("failed");
+                println!("buffer size {}", buf[..].len());
+                println!("read {} bytes from file", bytes);
+                if bytes != header.length as usize {
+                    println!("warning: bytes read ({}) != header.length ({})", bytes, header.length);
+                }
+                // reply
+                reply(&mut stream, header.cookie, Some(&mut buf[..]));
+                println!("successfully read");
+            },
+            NBD_CMD_WRITE => {
+                let mut buf = vec![0u8; header.length as usize];
+                let mut to_read: isize = header.length as isize;
+                let mut ptr = 0usize;
+                while to_read > 0 {
+                    let read = stream.read(&mut buf[ptr..]).expect("failed to read from stream") as isize;
+                    to_read -= read;
+                    ptr += read as usize;
+                }
+                file.seek(SeekFrom::Start(header.offset)).expect("failed to seek");
+                let bytes = file.write(&mut buf[..]).expect("failed to write to file");
+                println!("wrote {} bytes", bytes);
+                // reply
+                reply(&mut stream, header.cookie, None);
+                println!("successfully wrote");
+            },
+            NBD_CMD_FLUSH => {
+                file.sync_all().expect("failed to fsync");
+                reply(&mut stream, header.cookie, None);
+                println!("successfully flushed");
+            },
+            _ => {
+                // reply
+                reply(&mut stream, header.cookie, None);
+                println!("successfully handled request type {}", header.type_);
+            }
+        }
+    }
+    
+}
+
+fn transmission(mut stream: TcpStream) {
+    println!("this guys is trying to read, hold on");
+    let req_header: ReqHeader = {
+        let mut buf = [0u8; size_of::<ReqHeader>()];
+        stream.read_exact(&mut buf).expect("failed to read request header");
+        unsafe { transmute(buf) }
+    };
+    println!("read request header");
+    println!("request length {}", req_header.length);
+}
+
+fn handle_traffic(state_machine: &mut StateMachine, stream: TcpStream) {
+    // TODO: throw the state machine away
+    match state_machine.state {
+        STATE::HANDSHAKE => {
+            handshake(stream);
+            state_machine.state = STATE::TRANSMISSION;
+        },
+        STATE::TRANSMISSION => transmission(stream)
     }
 }
 
 fn main() {
     println!("starting server");
     let listener = TcpListener::bind("127.0.0.1:10809").expect("failed to open listener");
+    let mut state_machine = StateMachine{
+        state: STATE::HANDSHAKE
+    };
+
     for _stream in listener.incoming() {
-        // =========================== handshake ===========================
-        println!("got packet");
-        let mut stream = _stream.expect("no stream");
-
-        write_u64(&mut stream, NBDMAGIC);
-        write_u64(&mut stream, IHAVEOPT);
-        let handshake_flags: u16 = NBD_FLAG_FIXED_NEWSTYLE;
-        write_u16(&mut stream, handshake_flags);
-
-        // client u32 flags
-        let client_flags = read_u32(&mut stream);
-        println!("client flags: {}", client_flags);
-        if client_flags != NBD_FLAG_FIXED_NEWSTYLE as u32 {
-            // SHOULD
-            println!("client didn't set NBD_FLAG_FIXED_NEWSTYLE");
-        }
-        // client opts
-        let client_i_have_opts = read_u64(&mut stream);
-        println!("client_i_have_opts {}", client_i_have_opts);
-        if client_i_have_opts != IHAVEOPT {
-            // TODO: tell client it's unwelcome
-            panic!("client didn't send IHAVEOPT");
-        }
-        let client_opts = read_u32(&mut stream);
-        println!("client_opts {}", client_opts);
-        let client_opts_len = read_u32(&mut stream);
-        println!("client_opts_len {}", client_opts_len);
-        let mut opts_buf: [u8; 2048] = [0; 2048];
-        let _ = stream.read_exact(&mut opts_buf[..(client_opts_len as usize)]);
-        println!("client opts buf:");
-        for i in 0..(client_opts_len as usize) {
-            if opts_buf[i] <= 32 {
-                println!("{}", opts_buf[i]);
-            } else {
-                print!("{}", opts_buf[i] as char)
-            }
-        }
-        println!();
-
-        // server responds
-        write_u64(&mut stream, NBD_REPLY_MAGIC);
-        write_u32(&mut stream, client_opts);
-        write_u32(&mut stream, NBD_REP_ACK);
-        write_u32(&mut stream, 0); // make it easy, set to 0
-
-        // =========================== transmission ===========================
-
+        println!("got stream");
+        let stream = _stream.expect("no stream");
+        handle_traffic(&mut state_machine, stream);
     }
     // transmission
 }
