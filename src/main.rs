@@ -16,7 +16,12 @@ use std::net::{TcpListener, TcpStream};
 use std::io::{Write, Read, SeekFrom, Seek};
 use std::mem::{size_of, transmute};
 use std::fs::{File, exists, OpenOptions};
+use std::str::from_utf8;
 
+// --- server URL
+const URL: &str = "127.0.0.1:10809";
+
+// --- NBD flags
 const NBDMAGIC: u64 = 0x4e42444d41474943;
 const IHAVEOPT: u64 = 0x49484156454F5054;
 const NBD_FLAG_FIXED_NEWSTYLE: u16 = 1 << 0;
@@ -24,9 +29,10 @@ const NBD_REPLY_MAGIC: u64 = 0x3e889045565a9;
 const NBD_REP_ACK: u32 = 1;
 const NBD_REP_INFO: u32 = 3;
 const BLOCK_SIZE: u64 = 50 * 1024 * 1024; // 20MB
+const NBD_OPT_ABORT: u32 = 2;
 const NBD_OPT_GO: u32 = 7;
+const NBD_OPT_EXPORT_NAME: u32 = 1; // fallback
 const NBD_INFO_EXPORT: u16 = 0;
-const NBD_OPT_EXPORT_NAME: u32 = 0;
 const NBD_SIMPLE_REPLY_MAGIC: u32 = 0x67446698;
 
 // --- transmission flags
@@ -37,7 +43,8 @@ const NBD_CMD_READ: u16 = 0;
 const NBD_CMD_WRITE: u16 = 1;
 const NBD_CMD_FLUSH: u16 = 3;
 
-const FILE: &str = "disk.img";
+// default export
+const EXPORT_DEFAULT: &str = "disk";
 
 fn write_u16<W: Write>(writer: &mut W, data: u16) {
     writer.write_all(&data.to_be_bytes()).expect("failed to write u16");
@@ -135,24 +142,39 @@ fn handshake(mut stream: TcpStream) {
         // TODO: tell client it's unwelcome
         panic!("client didn't send IHAVEOPT");
     }
-    let client_opts = read_u32(&mut stream);
-    println!("client_opts {}", client_opts);
-    let client_opts_len = read_u32(&mut stream);
-    println!("client_opts_len {}", client_opts_len);
-    let mut opts_buf: [u8; 2048] = [0; 2048];
-    let _ = stream.read_exact(&mut opts_buf[..(client_opts_len as usize)]);
-    println!("client opts buf:");
-    for i in 0..(client_opts_len as usize) {
-        if opts_buf[i] <= 32 {
-            println!("{}", opts_buf[i]);
-        } else {
-            print!("{}", opts_buf[i] as char)
+    let client_opt = read_u32(&mut stream);
+    println!("client_opts {}", client_opt);
+    let client_opt_len = read_u32(&mut stream);
+    println!("client_opt_len {}", client_opt_len);
+    let mut opt_buf: [u8; 2048] = [0; 2048];
+    let _ = stream.read_exact(&mut opt_buf[..(client_opt_len as usize)]);
+    let name_sz = u32::from_be_bytes(opt_buf[0..4].try_into().expect("slice to fixed"));
+    let name_sz_uz = name_sz as usize;
+    let mut export_name: String = String::from(EXPORT_DEFAULT);
+    if name_sz != 0 {
+        export_name = String::from(from_utf8(&opt_buf[4..4+name_sz_uz]).expect("failed to utf8"));
+        println!("export name {}", export_name);
+        let info_request_num = u16::from_be_bytes(opt_buf[4+name_sz_uz..6+name_sz_uz].try_into().expect("slice to fixed"));
+        // we don't deal with them requests yet
+        for i in 0..info_request_num as usize {
+            let req = u16::from_be_bytes(opt_buf[6+name_sz_uz+i*2..6+name_sz_uz+(i+1)*2].try_into().expect("slice to fixed"));
+            println!("info request number {}", req);
         }
     }
-    println!();
 
+    if client_opt == NBD_OPT_ABORT {
+        println!("client sent abort");
+        write_u64(&mut stream, NBD_REPLY_MAGIC);
+        write_u32(&mut stream, NBD_OPT_ABORT);
+        write_u32(&mut stream, NBD_REP_ACK);
+        write_u32(&mut stream, 0);
+        println!("abort ACKed");
+        return;
+    }
+
+    // we assume it's NBD_OPT_GO
     write_u64(&mut stream, NBD_REPLY_MAGIC);
-    write_u32(&mut stream, NBD_OPT_EXPORT_NAME);
+    write_u32(&mut stream, NBD_OPT_EXPORT_NAME); // TODO: why NBD_OPT_EXPORT_NAME?
     write_u32(&mut stream, NBD_REP_INFO);
     write_u16(&mut stream, NBD_INFO_EXPORT);
     write_u16(&mut stream, 12);
@@ -168,10 +190,11 @@ fn handshake(mut stream: TcpStream) {
     println!("handshake completed");
 
     // =========================== transmission ===========================
-    if !exists(FILE).expect("failed to check if exists") {
-        File::create(FILE).expect("failed to create file");
+    let export_file: String = export_name + ".img";
+    if !exists(&export_file).expect("failed to check if exists") {
+        File::create(&export_file).expect("failed to create file");
     }
-    let mut file = OpenOptions::new().read(true).write(true).open(FILE).expect("failed to open file");
+    let mut file = OpenOptions::new().read(true).write(true).open(&export_file).expect("failed to open file");
     file.set_len(BLOCK_SIZE).expect("failed to set length");
 
     // only clear the file first time
@@ -196,7 +219,6 @@ fn handshake(mut stream: TcpStream) {
                 if bytes != header.length as usize {
                     println!("warning: bytes read ({}) != header.length ({})", bytes, header.length);
                 }
-                // reply
                 reply(&mut stream, header.cookie, Some(&mut buf[..]));
                 println!("successfully read");
             },
@@ -212,7 +234,6 @@ fn handshake(mut stream: TcpStream) {
                 file.seek(SeekFrom::Start(header.offset)).expect("failed to seek");
                 let bytes = file.write(&mut buf[..]).expect("failed to write to file");
                 println!("wrote {} bytes", bytes);
-                // reply
                 reply(&mut stream, header.cookie, None);
                 println!("successfully wrote");
             },
@@ -222,7 +243,6 @@ fn handshake(mut stream: TcpStream) {
                 println!("successfully flushed");
             },
             _ => {
-                // reply
                 reply(&mut stream, header.cookie, None);
                 println!("successfully handled request type {}", header.type_);
             }
@@ -255,7 +275,7 @@ fn handle_traffic(state_machine: &mut StateMachine, stream: TcpStream) {
 
 fn main() {
     println!("starting server");
-    let listener = TcpListener::bind("127.0.0.1:10809").expect("failed to open listener");
+    let listener = TcpListener::bind(URL).expect("failed to open listener");
     let mut state_machine = StateMachine{
         state: STATE::HANDSHAKE
     };
