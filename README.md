@@ -40,3 +40,8 @@ S3 storage start
 ```sh
 minio server minio
 ```
+
+Clear nbd connections
+```sh
+for i in {0..30}; do sudo nbd-client -d /dev/nbd${i}; done
+```

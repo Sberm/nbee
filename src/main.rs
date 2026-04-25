@@ -13,11 +13,13 @@
 //       --------------
 
 use std::net::{TcpListener, TcpStream};
-use std::io::{Write, Read, SeekFrom, Seek};
-use std::fs::{File, exists, OpenOptions};
+use std::io::{Write, Read};
 use std::str::from_utf8;
 
 mod s3;
+mod file;
+
+use crate::file::file::FileHandler;
 
 // --- server URL
 const URL: &str = "127.0.0.1:10809";
@@ -29,7 +31,7 @@ const NBD_FLAG_FIXED_NEWSTYLE: u16 = 1 << 0;
 const NBD_REPLY_MAGIC: u64 = 0x3e889045565a9;
 const NBD_REP_ACK: u32 = 1;
 const NBD_REP_INFO: u32 = 3;
-const BLOCK_SIZE: u64 = 50 * 1024 * 1024; // 20MB
+const BLOCK_SIZE: u64 = 50 * 1024 * 1024; // 50MB
 const NBD_OPT_ABORT: u32 = 2;
 const NBD_OPT_GO: u32 = 7;
 const NBD_OPT_EXPORT_NAME: u32 = 1; // fallback
@@ -44,8 +46,11 @@ const NBD_CMD_READ: u16 = 0;
 const NBD_CMD_WRITE: u16 = 1;
 const NBD_CMD_FLUSH: u16 = 3;
 
-// default export
+// --- default export
 const EXPORT_DEFAULT: &str = "disk";
+
+// --- export suffix
+const EXPORT_SUFFIX: &str = "_fork";
 
 fn write_u16<W: Write>(writer: &mut W, data: u16) {
     writer.write_all(&data.to_be_bytes()).expect("failed to write u16");
@@ -69,17 +74,6 @@ fn read_u64<R: Read>(reader: &mut R) -> u64 {
     let mut buf: [u8; 8] = [0; 8];
     reader.read_exact(&mut buf).expect("failed to read u64");
     u64::from_be_bytes(buf)
-}
-
-#[allow(unused)]
-fn clear_file(file: &mut File) {
-    let buf = [0u8; 8192];
-    let mut size: i64 = file.metadata().expect("fail to get metadata").len() as i64;
-    println!("clearing file of size {}", size);
-    while size > 0 {
-        size -= file.write(&buf).expect("failed to write") as i64;
-    }
-    file.flush().expect("fail to flush");
 }
 
 // problem: it's not compact
@@ -182,20 +176,22 @@ fn handle_traffic(mut stream: TcpStream) {
     println!("handshake completed");
 
     // =========================== transmission ===========================
-    let export_file: String = export_name + ".img";
-    if !exists(&export_file).expect("failed to check if exists") {
-        File::create(&export_file).expect("failed to create file");
+    let do_fork = export_name.find(EXPORT_SUFFIX).is_some();
+    let mut export_name_suffix_removed: String = export_name.clone();
+    if do_fork {
+        let idx = export_name.find(EXPORT_SUFFIX).expect("failed to get suffix index");
+        export_name_suffix_removed = export_name[..idx].to_string();
     }
-    let mut file = OpenOptions::new().read(true).write(true).open(&export_file).expect("failed to open file");
-    file.set_len(BLOCK_SIZE).expect("failed to set length");
-
-    // only clear the file first time
-    // clear_file(&mut file);
-
     let bucket = s3::S3Bucket::new();
 
+    let mut file_handler = if do_fork && bucket.object_exists(&(export_name_suffix_removed.clone() + ".img")) {
+        FileHandler::fork(&export_name_suffix_removed)
+    } else {
+        FileHandler::new(&export_name)
+    };
+
     loop {
-        file.rewind().expect("file failed to rewind");
+        file_handler.rewind();
         // read header
         let mut header = ReqHeader {..Default::default()};
         read_header(&mut stream, &mut header);
@@ -205,9 +201,8 @@ fn handle_traffic(mut stream: TcpStream) {
         // TODO: implement read
         match header.type_ {
             NBD_CMD_READ => {
-                file.seek(SeekFrom::Start(header.offset)).expect("failed to seek");
                 let mut buf = vec![0u8; header.length as usize];
-                let bytes = file.read(&mut buf[..]).expect("failed");
+                let bytes = file_handler.read(header.offset, &mut buf);
                 println!("buffer size {}", buf[..].len());
                 println!("read {} bytes from file", bytes);
                 if bytes != header.length as usize {
@@ -225,15 +220,13 @@ fn handle_traffic(mut stream: TcpStream) {
                     to_read -= read;
                     ptr += read as usize;
                 }
-                file.seek(SeekFrom::Start(header.offset)).expect("failed to seek");
-                let bytes = file.write(&mut buf[..]).expect("failed to write to file");
+                let bytes = file_handler.write(header.offset, &mut buf);
                 println!("wrote {} bytes", bytes);
                 reply(&mut stream, header.cookie, None);
                 println!("successfully wrote");
             },
             NBD_CMD_FLUSH => {
-                file.sync_all().expect("failed to fsync");
-                bucket.put_object(&mut file, &export_file);
+                file_handler.flush();
                 reply(&mut stream, header.cookie, None);
                 println!("successfully flushed");
             },
