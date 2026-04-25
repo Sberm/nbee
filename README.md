@@ -35,3 +35,8 @@ $ sudo umount /mnt
 
 $ sudo nbd-client -d /dev/nbd3
 ```
+
+S3 storage start
+```sh
+minio server minio
+```

@@ -1,4 +1,10 @@
 target/
 
+# S3 storage
+minio
+
 # persistent files
 *.img
+
+# debug output
+*.txt

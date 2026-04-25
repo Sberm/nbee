@@ -14,9 +14,10 @@
 
 use std::net::{TcpListener, TcpStream};
 use std::io::{Write, Read, SeekFrom, Seek};
-use std::mem::{size_of, transmute};
 use std::fs::{File, exists, OpenOptions};
 use std::str::from_utf8;
+
+mod s3;
 
 // --- server URL
 const URL: &str = "127.0.0.1:10809";
@@ -92,15 +93,6 @@ struct ReqHeader {
     length: u32
 }
 
-enum STATE {
-    HANDSHAKE,
-    TRANSMISSION
-}
-
-struct StateMachine {
-    state: STATE
-}
-
 fn read_header(stream: &mut TcpStream, req_header: &mut ReqHeader) {
     let mut buf = [0u8; 28];
     let _ = stream.read_exact(&mut buf).expect("failed to read request header");
@@ -121,8 +113,8 @@ fn reply(stream: &mut TcpStream, cookie: u64, buf: Option<&mut [u8]>) {
     }
 }
 
-// =========================== handshake ===========================
-fn handshake(mut stream: TcpStream) {
+fn handle_traffic(mut stream: TcpStream) {
+    // =========================== handshake ===========================
     write_u64(&mut stream, NBDMAGIC);
     write_u64(&mut stream, IHAVEOPT);
     let handshake_flags: u16 = NBD_FLAG_FIXED_NEWSTYLE;
@@ -200,6 +192,8 @@ fn handshake(mut stream: TcpStream) {
     // only clear the file first time
     // clear_file(&mut file);
 
+    let bucket = s3::S3Bucket::new();
+
     loop {
         file.rewind().expect("file failed to rewind");
         // read header
@@ -239,6 +233,7 @@ fn handshake(mut stream: TcpStream) {
             },
             NBD_CMD_FLUSH => {
                 file.sync_all().expect("failed to fsync");
+                bucket.put_object(&mut file, &export_file);
                 reply(&mut stream, header.cookie, None);
                 println!("successfully flushed");
             },
@@ -251,39 +246,13 @@ fn handshake(mut stream: TcpStream) {
     
 }
 
-fn transmission(mut stream: TcpStream) {
-    println!("this guys is trying to read, hold on");
-    let req_header: ReqHeader = {
-        let mut buf = [0u8; size_of::<ReqHeader>()];
-        stream.read_exact(&mut buf).expect("failed to read request header");
-        unsafe { transmute(buf) }
-    };
-    println!("read request header");
-    println!("request length {}", req_header.length);
-}
-
-fn handle_traffic(state_machine: &mut StateMachine, stream: TcpStream) {
-    // TODO: throw the state machine away
-    match state_machine.state {
-        STATE::HANDSHAKE => {
-            handshake(stream);
-            state_machine.state = STATE::TRANSMISSION;
-        },
-        STATE::TRANSMISSION => transmission(stream)
-    }
-}
-
 fn main() {
     println!("starting server");
     let listener = TcpListener::bind(URL).expect("failed to open listener");
-    let mut state_machine = StateMachine{
-        state: STATE::HANDSHAKE
-    };
-
     for _stream in listener.incoming() {
         println!("got stream");
         let stream = _stream.expect("no stream");
-        handle_traffic(&mut state_machine, stream);
+        handle_traffic(stream);
     }
     // transmission
 }
