@@ -38,6 +38,7 @@ $ sudo nbd-client -d /dev/nbd3
 
 S3 storage start
 ```sh
+mkdir minio
 minio server minio
 ```
 
