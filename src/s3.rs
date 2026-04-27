@@ -42,6 +42,7 @@ impl S3Bucket {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn test_s3() {
@@ -55,5 +56,13 @@ mod test {
         let bucket = S3Bucket::new();
         let cursor = Cursor::new([1, 2, 3]);
         bucket.put_object(cursor, "onetwothree.txt");
+    }
+
+    #[test]
+    fn test_object_exists() {
+        let bucket = S3Bucket::new();
+        // should always exists...
+        let object_name = "test_device.img";
+        assert_eq!(bucket.object_exists(object_name), true);
     }
 }

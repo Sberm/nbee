@@ -31,7 +31,7 @@ const NBD_FLAG_FIXED_NEWSTYLE: u16 = 1 << 0;
 const NBD_REPLY_MAGIC: u64 = 0x3e889045565a9;
 const NBD_REP_ACK: u32 = 1;
 const NBD_REP_INFO: u32 = 3;
-const BLOCK_SIZE: u64 = 50 * 1024 * 1024; // 50MB
+const BLOCK_SIZE: u64 = 5 * 1024 * 1024; // 5MB
 const NBD_OPT_ABORT: u32 = 2;
 const NBD_OPT_GO: u32 = 7;
 const NBD_OPT_EXPORT_NAME: u32 = 1; // fallback
@@ -44,6 +44,7 @@ const NBD_FLAG_SEND_FLUSH: u16 = 1 << 2;
 // --- request types
 const NBD_CMD_READ: u16 = 0;
 const NBD_CMD_WRITE: u16 = 1;
+const NBD_CMD_DISC: u16 = 2;
 const NBD_CMD_FLUSH: u16 = 3;
 
 // --- default export
@@ -176,6 +177,11 @@ fn handle_traffic(mut stream: TcpStream) {
     println!("handshake completed");
 
     // =========================== transmission ===========================
+    
+    // fork: COPY ON WRITE
+    // if you want an export called "foo_fork" when "foo" already exists,
+    // you created a fork. This fork doesn't allocate real space until
+    // the first write request.
     let do_fork = export_name.find(EXPORT_SUFFIX).is_some();
     let mut export_name_suffix_removed: String = export_name.clone();
     if do_fork {
@@ -184,7 +190,10 @@ fn handle_traffic(mut stream: TcpStream) {
     }
     let bucket = s3::S3Bucket::new();
 
-    let mut file_handler = if do_fork && bucket.object_exists(&(export_name_suffix_removed.clone() + ".img")) {
+    let mut file_handler = if do_fork &&
+                              bucket.object_exists(&(export_name_suffix_removed.clone() + ".img")) &&
+                              !bucket.object_exists(&(export_name.clone() + ".img")) {
+        println!("creating fork of {}", export_name_suffix_removed);
         FileHandler::fork(&export_name_suffix_removed)
     } else {
         FileHandler::new(&export_name)
@@ -198,7 +207,6 @@ fn handle_traffic(mut stream: TcpStream) {
         println!("got request");
         println!("header {:?}", header);
 
-        // TODO: implement read
         match header.type_ {
             NBD_CMD_READ => {
                 let mut buf = vec![0u8; header.length as usize];
@@ -224,6 +232,10 @@ fn handle_traffic(mut stream: TcpStream) {
                 println!("wrote {} bytes", bytes);
                 reply(&mut stream, header.cookie, None);
                 println!("successfully wrote");
+            },
+            NBD_CMD_DISC => {
+                println!("successfully disconnected");
+                return;
             },
             NBD_CMD_FLUSH => {
                 file_handler.flush();
