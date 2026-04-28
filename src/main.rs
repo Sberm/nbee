@@ -57,15 +57,24 @@ const EXPORT_DEFAULT: &str = "disk";
 const EXPORT_SUFFIX: &str = "_fork";
 
 fn write_u16<W: Write>(writer: &mut W, data: u16) {
-    writer.write_all(&data.to_be_bytes()).expect("failed to write u16");
+    match writer.write_all(&data.to_be_bytes()) {
+        Ok(_) => {},
+        Err(e) => {eprintln!("{}", e)}
+    }
 }
 
 fn write_u32<W: Write>(writer: &mut W, data: u32) {
-    writer.write_all(&data.to_be_bytes()).expect("failed to write u32");
+    match writer.write_all(&data.to_be_bytes()) {
+        Ok(_) => {},
+        Err(e) => {eprintln!("{}", e)}
+    }
 }
 
 fn write_u64<W: Write>(writer: &mut W, data: u64) {
-    writer.write_all(&data.to_be_bytes()).expect("failed to write u64");
+    match writer.write_all(&data.to_be_bytes()) {
+        Ok(_) => {},
+        Err(e) => {eprintln!("{}", e)}
+    }
 }
 
 fn read_u32<R: Read>(reader: &mut R) -> u32 {
