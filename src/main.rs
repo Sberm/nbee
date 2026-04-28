@@ -12,8 +12,8 @@
 //      \    (_/\_)    /
 //       --------------
 
-use std::net::{TcpListener, TcpStream};
-use std::io::{Write, Read};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::str::from_utf8;
 
 mod s3;
@@ -56,36 +56,36 @@ const EXPORT_DEFAULT: &str = "disk";
 // --- export suffix
 const EXPORT_SUFFIX: &str = "_fork";
 
-fn write_u16<W: Write>(writer: &mut W, data: u16) {
-    match writer.write_all(&data.to_be_bytes()) {
+async fn write_u16<W: AsyncWriteExt + Unpin>(writer: &mut W, data: u16) {
+    match writer.write_all(&data.to_be_bytes()).await {
         Ok(_) => {},
         Err(e) => {eprintln!("{}", e)}
     }
 }
 
-fn write_u32<W: Write>(writer: &mut W, data: u32) {
-    match writer.write_all(&data.to_be_bytes()) {
+async fn write_u32<W: AsyncWriteExt + Unpin>(writer: &mut W, data: u32) {
+    match writer.write_all(&data.to_be_bytes()).await {
         Ok(_) => {},
         Err(e) => {eprintln!("{}", e)}
     }
 }
 
-fn write_u64<W: Write>(writer: &mut W, data: u64) {
-    match writer.write_all(&data.to_be_bytes()) {
+async fn write_u64<W: AsyncWriteExt + Unpin>(writer: &mut W, data: u64) {
+    match writer.write_all(&data.to_be_bytes()).await {
         Ok(_) => {},
         Err(e) => {eprintln!("{}", e)}
     }
 }
 
-fn read_u32<R: Read>(reader: &mut R) -> u32 {
+async fn read_u32<R: AsyncReadExt + Unpin>(reader: &mut R) -> u32 {
     let mut buf: [u8; 4] = [0; 4];
-    reader.read_exact(&mut buf).expect("failed to read u32");
+    reader.read_exact(&mut buf).await.expect("failed to read u32");
     u32::from_be_bytes(buf)
 }
 
-fn read_u64<R: Read>(reader: &mut R) -> u64 {
+async fn read_u64<R: AsyncReadExt + Unpin>(reader: &mut R) -> u64 {
     let mut buf: [u8; 8] = [0; 8];
-    reader.read_exact(&mut buf).expect("failed to read u64");
+    reader.read_exact(&mut buf).await.expect("failed to read u64");
     u64::from_be_bytes(buf)
 }
 
@@ -100,9 +100,9 @@ struct ReqHeader {
     length: u32
 }
 
-fn read_header(stream: &mut TcpStream, req_header: &mut ReqHeader) {
+async fn read_header(stream: &mut TcpStream, req_header: &mut ReqHeader) {
     let mut buf = [0u8; 28];
-    let _ = stream.read_exact(&mut buf).expect("failed to read request header");
+    let _ = stream.read_exact(&mut buf).await.expect("failed to read request header");
     req_header.magic = u32::from_be_bytes(buf[0..4].try_into().expect("failed to turn slice to [u8; 4]"));
     req_header.comm_flags = u16::from_be_bytes(buf[4..6].try_into().expect("failed to turn slice to [u8; 2]"));
     req_header.type_ = u16::from_be_bytes(buf[6..8].try_into().expect("failed to turn slice to [u8; 2]"));
@@ -111,24 +111,26 @@ fn read_header(stream: &mut TcpStream, req_header: &mut ReqHeader) {
     req_header.length = u32::from_be_bytes(buf[24..28].try_into().expect("failed to turn slice to [u8; 4]"));
 }
 
-fn reply(stream: &mut TcpStream, cookie: u64, buf: Option<&mut [u8]>) {
-    write_u32(stream, NBD_SIMPLE_REPLY_MAGIC);
-    write_u32(stream, 0); // error code
-    write_u64(stream, cookie);
+async fn reply(stream: &mut TcpStream, cookie: u64, buf: Option<&mut [u8]>) {
+    write_u32(stream, NBD_SIMPLE_REPLY_MAGIC).await;
+    write_u32(stream, 0).await; // error code
+    write_u64(stream, cookie).await;
     if buf.is_some() {
-        stream.write_all(buf.expect("I thought it was some")).expect("failed to write all");
+        stream.write_all(buf.expect("I thought it was some")).await.expect("failed to write all");
     }
 }
 
-fn handle_traffic(mut stream: TcpStream) {
+async fn handle_traffic(mut stream: TcpStream) {
+    println!("got stream");
+
     // =========================== handshake ===========================
-    write_u64(&mut stream, NBDMAGIC);
-    write_u64(&mut stream, IHAVEOPT);
+    write_u64(&mut stream, NBDMAGIC).await;
+    write_u64(&mut stream, IHAVEOPT).await;
     let handshake_flags: u16 = NBD_FLAG_FIXED_NEWSTYLE;
-    write_u16(&mut stream, handshake_flags);
+    write_u16(&mut stream, handshake_flags).await;
 
     // client u32 flags
-    let client_flags = read_u32(&mut stream);
+    let client_flags = read_u32(&mut stream).await;
     println!("client flags: {}", client_flags);
     // TODO: that conversion looks weird
     if client_flags != NBD_FLAG_FIXED_NEWSTYLE as u32 {
@@ -136,18 +138,18 @@ fn handle_traffic(mut stream: TcpStream) {
         println!("client didn't set NBD_FLAG_FIXED_NEWSTYLE");
     }
     // client opts
-    let client_i_have_opts = read_u64(&mut stream);
+    let client_i_have_opts = read_u64(&mut stream).await;
     println!("client_i_have_opts {}", client_i_have_opts);
     if client_i_have_opts != IHAVEOPT {
         // TODO: tell client it's unwelcome
         panic!("client didn't send IHAVEOPT");
     }
-    let client_opt = read_u32(&mut stream);
+    let client_opt = read_u32(&mut stream).await;
     println!("client_opts {}", client_opt);
-    let client_opt_len = read_u32(&mut stream);
+    let client_opt_len = read_u32(&mut stream).await;
     println!("client_opt_len {}", client_opt_len);
     let mut opt_buf: [u8; 2048] = [0; 2048];
-    let _ = stream.read_exact(&mut opt_buf[..(client_opt_len as usize)]);
+    let _ = stream.read_exact(&mut opt_buf[..(client_opt_len as usize)]).await;
     let name_sz = u32::from_be_bytes(opt_buf[0..4].try_into().expect("slice to fixed"));
     let name_sz_uz = name_sz as usize;
     let mut export_name: String = String::from(EXPORT_DEFAULT);
@@ -164,29 +166,29 @@ fn handle_traffic(mut stream: TcpStream) {
 
     if client_opt == NBD_OPT_ABORT {
         println!("client sent abort");
-        write_u64(&mut stream, NBD_REPLY_MAGIC);
-        write_u32(&mut stream, NBD_OPT_ABORT);
-        write_u32(&mut stream, NBD_REP_ACK);
-        write_u32(&mut stream, 0);
+        write_u64(&mut stream, NBD_REPLY_MAGIC).await;
+        write_u32(&mut stream, NBD_OPT_ABORT).await;
+        write_u32(&mut stream, NBD_REP_ACK).await;
+        write_u32(&mut stream, 0).await;
         println!("abort ACKed");
         return;
     }
 
     // we assume it's NBD_OPT_GO
-    write_u64(&mut stream, NBD_REPLY_MAGIC);
-    write_u32(&mut stream, NBD_OPT_EXPORT_NAME); // TODO: why NBD_OPT_EXPORT_NAME?
-    write_u32(&mut stream, NBD_REP_INFO);
-    write_u16(&mut stream, NBD_INFO_EXPORT);
-    write_u16(&mut stream, 12);
-    write_u16(&mut stream, NBD_INFO_EXPORT);
-    write_u64(&mut stream, BLOCK_SIZE);
-    write_u16(&mut stream, NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_FUA); // enables flush and FUA
+    write_u64(&mut stream, NBD_REPLY_MAGIC).await;
+    write_u32(&mut stream, NBD_OPT_EXPORT_NAME).await; // TODO: why NBD_OPT_EXPORT_NAME?
+    write_u32(&mut stream, NBD_REP_INFO).await;
+    write_u16(&mut stream, NBD_INFO_EXPORT).await;
+    write_u16(&mut stream, 12).await;
+    write_u16(&mut stream, NBD_INFO_EXPORT).await;
+    write_u64(&mut stream, BLOCK_SIZE).await;
+    write_u16(&mut stream, NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_FUA).await; // enables flush and FUA
     println!("wrote size");
 
-    write_u64(&mut stream, NBD_REPLY_MAGIC);
-    write_u32(&mut stream, NBD_OPT_GO);
-    write_u32(&mut stream, NBD_REP_ACK);
-    write_u32(&mut stream, 0); // make it easy, set to 0
+    write_u64(&mut stream, NBD_REPLY_MAGIC).await;
+    write_u32(&mut stream, NBD_OPT_GO).await;
+    write_u32(&mut stream, NBD_REP_ACK).await;
+    write_u32(&mut stream, 0).await; // make it easy, set to 0
     println!("handshake completed");
 
     // =========================== transmission ===========================
@@ -215,7 +217,7 @@ fn handle_traffic(mut stream: TcpStream) {
     loop {
         // read header
         let mut header = ReqHeader {..Default::default()};
-        read_header(&mut stream, &mut header);
+        read_header(&mut stream, &mut header).await;
         println!("got request");
         println!("header {:?}", header);
 
@@ -228,7 +230,7 @@ fn handle_traffic(mut stream: TcpStream) {
                 if bytes != header.length as usize {
                     println!("warning: bytes read ({}) != header.length ({})", bytes, header.length);
                 }
-                reply(&mut stream, header.cookie, Some(&mut buf[..]));
+                reply(&mut stream, header.cookie, Some(&mut buf[..])).await;
                 println!("successfully read");
             },
             NBD_CMD_WRITE => {
@@ -236,7 +238,7 @@ fn handle_traffic(mut stream: TcpStream) {
                 let mut to_read: isize = header.length as isize;
                 let mut ptr = 0usize;
                 while to_read > 0 {
-                    let read = stream.read(&mut buf[ptr..]).expect("failed to read from stream") as isize;
+                    let read = stream.read(&mut buf[ptr..]).await.expect("failed to read from stream") as isize;
                     to_read -= read;
                     ptr += read as usize;
                 }
@@ -247,7 +249,7 @@ fn handle_traffic(mut stream: TcpStream) {
                     file_handler.flush();
                 }
                 println!("wrote {} bytes", bytes);
-                reply(&mut stream, header.cookie, None);
+                reply(&mut stream, header.cookie, None).await;
                 println!("successfully wrote");
             },
             NBD_CMD_DISC => {
@@ -256,11 +258,11 @@ fn handle_traffic(mut stream: TcpStream) {
             },
             NBD_CMD_FLUSH => {
                 file_handler.flush();
-                reply(&mut stream, header.cookie, None);
+                reply(&mut stream, header.cookie, None).await;
                 println!("successfully flushed");
             },
             _ => {
-                reply(&mut stream, header.cookie, None);
+                reply(&mut stream, header.cookie, None).await;
                 println!("successfully handled request type {}", header.type_);
             }
         }
@@ -268,13 +270,15 @@ fn handle_traffic(mut stream: TcpStream) {
     
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("starting server");
-    let listener = TcpListener::bind(URL).expect("failed to open listener");
-    for _stream in listener.incoming() {
-        println!("got stream");
-        let stream = _stream.expect("no stream");
-        handle_traffic(stream);
+    let listener = TcpListener::bind(URL).await.expect("failed to open listener");
+    loop {
+        let (stream, _) = listener.accept().await.expect("await listener failed");
+        tokio::spawn(async move {
+            handle_traffic(stream).await;
+        });
     }
     // transmission
 }

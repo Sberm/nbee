@@ -42,6 +42,11 @@ mkdir minio
 minio server minio
 ```
 
+Create `mnt` directory for testing
+```sh
+mkdir mnt
+```
+
 Clear nbd connections
 ```sh
 for i in {0..30}; do sudo nbd-client -d /dev/nbd${i}; done
