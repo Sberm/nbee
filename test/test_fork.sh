@@ -74,8 +74,6 @@ touch "${FILE}"
 echo "${FILE_CONTENT}" > "${FILE}"
 echo "detaching original"
 sudo umount /mnt
-# sleep so the server is able to write all the remaining data, before disconnecting
-sleep 2
 sudo nbd-client -d "${device}"
 
 
@@ -104,7 +102,6 @@ if exists_tmp_storage; then
 fi
 echo "detaching readonly fork"
 sudo umount /mnt
-sleep 2
 sudo nbd-client -d "${device}"
 
 
