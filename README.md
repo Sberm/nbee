@@ -51,3 +51,7 @@ Clear nbd connections
 ```sh
 for i in {0..30}; do sudo nbd-client -d /dev/nbd${i}; done
 ```
+
+TODO:
+
+- Memory caching

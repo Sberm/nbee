@@ -14,7 +14,11 @@
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use tokio::time::{sleep, Duration};
+use tokio::sync::Mutex;
 use std::str::from_utf8;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod s3;
 mod file;
@@ -55,6 +59,11 @@ const EXPORT_DEFAULT: &str = "disk";
 
 // --- export suffix
 const EXPORT_SUFFIX: &str = "_fork";
+
+// IOPS = TOKEN_MX / SLEEP_TIME * MSEC_PER_SEC(1000)
+const SLEEP_TIME: u64 = 200;
+const TOKEN_REFILL_TIME: u64 = SLEEP_TIME;
+const TOKEN_MX: usize = 100;
 
 async fn write_u16<W: AsyncWriteExt + Unpin>(writer: &mut W, data: u16) {
     match writer.write_all(&data.to_be_bytes()).await {
@@ -120,7 +129,7 @@ async fn reply(stream: &mut TcpStream, cookie: u64, buf: Option<&mut [u8]>) {
     }
 }
 
-async fn handle_traffic(mut stream: TcpStream) {
+async fn handle_traffic(mut stream: TcpStream, token_bucket: Arc<AtomicUsize>) {
     println!("got stream");
 
     // =========================== handshake ===========================
@@ -221,6 +230,12 @@ async fn handle_traffic(mut stream: TcpStream) {
         println!("got request");
         println!("header {:?}", header);
 
+        while token_bucket.load(Ordering::SeqCst) == 0 {
+            println!("out of tokens, sleep for {}ms", SLEEP_TIME);
+            sleep(Duration::from_millis(SLEEP_TIME)).await;
+        }
+        token_bucket.fetch_sub(1, Ordering::SeqCst);
+
         match header.type_ {
             NBD_CMD_READ => {
                 let mut buf = vec![0u8; header.length as usize];
@@ -274,11 +289,40 @@ async fn handle_traffic(mut stream: TcpStream) {
 async fn main() {
     println!("starting server");
     let listener = TcpListener::bind(URL).await.expect("failed to open listener");
+    let token_buckets:Arc<Mutex<Vec<Arc<AtomicUsize>>>> = Arc::new(Mutex::new(vec![]));
+    let token_buckets_add = token_buckets.clone();
+    let mut idx = 0;
+
+    // TODO: make it a separate thread
+    // token bucket task
+    tokio::spawn(async move {
+        loop {
+            {
+                let tbs = token_buckets_add.lock().await;
+                let mut tbs_idx = 0;
+                if tbs.len() != 0 {
+                    for token_bucket in &*tbs {
+                        print!("token[{}] = {} ", tbs_idx, token_bucket.load(Ordering::SeqCst));
+                        token_bucket.store(TOKEN_MX, Ordering::SeqCst);
+                        tbs_idx += 1;
+                    }
+                    println!();
+                }
+            } // lock
+            sleep(Duration::from_millis(TOKEN_REFILL_TIME)).await;
+        }
+    });
+
+    // network IO task
     loop {
         let (stream, _) = listener.accept().await.expect("await listener failed");
+
+        token_buckets.lock().await.push(Arc::new(AtomicUsize::new(TOKEN_MX)));
+        let token_bucket = token_buckets.lock().await[idx].clone();
+
         tokio::spawn(async move {
-            handle_traffic(stream).await;
+            handle_traffic(stream, token_bucket).await;
         });
+        idx += 1;
     }
-    // transmission
 }
