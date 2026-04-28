@@ -131,7 +131,6 @@ if ! exists_tmp_storage; then
 fi
 echo "detaching writeable fork"
 sudo umount /mnt
-sleep 2
 sudo nbd-client -d "${device}"
 
 printf "\033[0;32m[PASSED]\033[0m\n"
