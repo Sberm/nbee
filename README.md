@@ -55,3 +55,5 @@ for i in {0..30}; do sudo nbd-client -d /dev/nbd${i}; done
 TODO:
 
 - Memory caching
+- Prevent multiple servers from writing to the same disk in s3
+- More tests
