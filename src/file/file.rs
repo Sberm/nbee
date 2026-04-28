@@ -17,6 +17,7 @@ fn clear_file(file: &mut File) {
     let buf = [0u8; 8192];
     let mut size: i64 = file.metadata().expect("fail to get metadata").len() as i64;
     println!("clearing file of size {}", size);
+    // TODO: handle size to write < 8192
     while size > 0 {
         size -= file.write(&buf).expect("failed to write") as i64;
     }
@@ -24,6 +25,7 @@ fn clear_file(file: &mut File) {
 }
 
 fn get_file_or_empty(filename: &str, bucket: &S3Bucket) -> File {
+    // TODO: timestamp and versioning
     if !exists(filename).expect("failed to check if exists") {
         File::create(filename).expect("failed to create file");
         let mut file = OpenOptions::new().read(true).write(true).open(filename).expect("failed to open file");
