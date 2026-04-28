@@ -70,10 +70,6 @@ impl FileHandler {
         }
     }
 
-    pub fn rewind(&mut self) {
-        self.file.rewind().expect("failed to rewind");
-    }
-
     pub fn read(&mut self, offset: u64, buf: &mut [u8]) -> usize {
         self.file.seek(SeekFrom::Start(offset)).expect("failed to seek");
         self.file.read(buf).expect("failed to read")

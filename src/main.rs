@@ -40,6 +40,9 @@ const NBD_SIMPLE_REPLY_MAGIC: u32 = 0x67446698;
 
 // --- transmission flags
 const NBD_FLAG_SEND_FLUSH: u16 = 1 << 2;
+const NBD_FLAG_SEND_FUA: u16 = 1 << 3;
+
+const NBD_CMD_FLAG_FUA: u16 = 1 << 0;
 
 // --- request types
 const NBD_CMD_READ: u16 = 0;
@@ -118,6 +121,7 @@ fn handle_traffic(mut stream: TcpStream) {
     // client u32 flags
     let client_flags = read_u32(&mut stream);
     println!("client flags: {}", client_flags);
+    // TODO: that conversion looks weird
     if client_flags != NBD_FLAG_FIXED_NEWSTYLE as u32 {
         // SHOULD
         println!("client didn't set NBD_FLAG_FIXED_NEWSTYLE");
@@ -167,7 +171,7 @@ fn handle_traffic(mut stream: TcpStream) {
     write_u16(&mut stream, 12);
     write_u16(&mut stream, NBD_INFO_EXPORT);
     write_u64(&mut stream, BLOCK_SIZE);
-    write_u16(&mut stream, NBD_FLAG_SEND_FLUSH);// transmission flags
+    write_u16(&mut stream, NBD_FLAG_SEND_FLUSH | NBD_FLAG_SEND_FUA); // enables flush and FUA
     println!("wrote size");
 
     write_u64(&mut stream, NBD_REPLY_MAGIC);
@@ -200,7 +204,6 @@ fn handle_traffic(mut stream: TcpStream) {
     };
 
     loop {
-        file_handler.rewind();
         // read header
         let mut header = ReqHeader {..Default::default()};
         read_header(&mut stream, &mut header);
@@ -229,6 +232,11 @@ fn handle_traffic(mut stream: TcpStream) {
                     ptr += read as usize;
                 }
                 let bytes = file_handler.write(header.offset, &mut buf);
+                if header.comm_flags & NBD_CMD_FLAG_FUA != 0 {
+                    // write through
+                    println!("FUAing");
+                    file_handler.flush();
+                }
                 println!("wrote {} bytes", bytes);
                 reply(&mut stream, header.cookie, None);
                 println!("successfully wrote");
